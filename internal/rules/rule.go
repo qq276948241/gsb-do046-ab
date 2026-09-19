@@ -31,50 +31,68 @@ type FrontmatterGenerator interface {
 	Generate(builder *strings.Builder, s *schema.Schema) bool
 }
 
-// Validator manages and runs all rules
+// option is the shared configuration for both the Validator and the Generator.
+type option struct {
+	registry *Registry
+	only     map[string]bool
+}
+
+// Option customizes which checkers a Validator or Generator uses.
+type Option func(*option)
+
+// WithRegistry supplies the single shared checker registry. Both checking and
+// generation consume the same registry instance so a checker is registered
+// exactly once.
+func WithRegistry(registry *Registry) Option {
+	return func(o *option) {
+		o.registry = registry
+	}
+}
+
+// WithOnly restricts a run to the named checkers, addressed by their Name().
+// They still execute in global registration order. The main entry point is
+// unchanged; this simply selects a subset (or a single checker in isolation).
+func WithOnly(names ...string) Option {
+	return func(o *option) {
+		o.only = make(map[string]bool, len(names))
+		for _, name := range names {
+			o.only[name] = true
+		}
+	}
+}
+
+func defaultOption() option {
+	return option{registry: DefaultRegistry()}
+}
+
+func (o option) checkers() []Rule {
+	if o.only != nil {
+		names := make([]string, 0, len(o.only))
+		for name := range o.only {
+			names = append(names, name)
+		}
+		return o.registry.buildNamed(names)
+	}
+	return o.registry.build()
+}
+
+// Validator manages and runs the checkers obtained from a registry.
 type Validator struct {
-	rules []Rule
+	option
 }
 
-// defaultStructuralRules returns the standard set of structural validation rules
-func defaultStructuralRules() []StructuralRule {
-	return []StructuralRule{
-		NewStructureRule(),
-		NewRequiredTextRule(),
-		NewForbiddenTextRule(),
-		NewCodeBlockRule(),
-		NewImageRule(),
-		NewTableRule(),
-		NewListRule(),
-		NewWordCountRule(),
-		NewParagraphRule(),
-	}
-}
+// Registry returns the registry this validator draws its checkers from.
+func (v *Validator) Registry() *Registry { return v.option.registry }
 
-// defaultDocumentRules returns validation rules that operate at document level
-func defaultDocumentRules() []Rule {
-	return []Rule{
-		NewHeadingRule(),
-		NewLinkValidationRule(),
+// NewValidator creates a validator backed by the default shared registry.
+// Pass WithRegistry and/or WithOnly to run a different implementation or just
+// one named checker without modifying this entry point.
+func NewValidator(opts ...Option) *Validator {
+	o := defaultOption()
+	for _, opt := range opts {
+		opt(&o)
 	}
-}
-
-// defaultRules returns all rules as base Rule interface
-func defaultRules() []Rule {
-	rules := make([]Rule, 0)
-	for _, r := range defaultStructuralRules() {
-		rules = append(rules, r)
-	}
-	rules = append(rules, defaultDocumentRules()...)
-	rules = append(rules, NewFrontmatterRule())
-	return rules
-}
-
-// NewValidator creates a new validator with default rules for v0.1 DSL
-func NewValidator() *Validator {
-	return &Validator{
-		rules: defaultRules(),
-	}
+	return &Validator{option: o}
 }
 
 // Validate runs all rules against a document with a specified root directory.
@@ -85,7 +103,7 @@ func (v *Validator) Validate(doc *parser.Document, s *schema.Schema, rootDir str
 	// Create validation context with VAST
 	ctx := vast.NewContext(doc, s, rootDir)
 
-	for _, rule := range v.rules {
+	for _, rule := range v.checkers() {
 		ruleViolations := rule.ValidateWithContext(ctx)
 		violations = append(violations, ruleViolations...)
 	}
@@ -93,26 +111,43 @@ func (v *Validator) Validate(doc *parser.Document, s *schema.Schema, rootDir str
 	return violations
 }
 
-// Generator creates markdown content using rules
+// Generator creates markdown content using the same registered checkers as the
+// Validator. It discovers capabilities by interface rather than by branching on
+// concrete checker kinds, so registering a checker once is enough for both
+// checking and generation.
 type Generator struct {
-	structuralRules      []StructuralRule
-	frontmatterGenerator FrontmatterGenerator
+	option
 }
 
-// NewGenerator creates a generator that uses the same rules as the validator
-func NewGenerator() *Generator {
-	return &Generator{
-		structuralRules:      defaultStructuralRules(),
-		frontmatterGenerator: NewFrontmatterRule(),
+// Registry returns the registry this generator draws its checkers from.
+func (g *Generator) Registry() *Registry { return g.option.registry }
+
+// NewGenerator creates a template generator backed by the default shared
+// registry. As with NewValidator, WithRegistry/WithOnly can swap in another
+// implementation or select individual checkers.
+func NewGenerator(opts ...Option) *Generator {
+	o := defaultOption()
+	for _, opt := range opts {
+		opt(&o)
 	}
+	return &Generator{option: o}
 }
 
 // GenerateContent generates content for an element using all applicable rules
 func (g *Generator) GenerateContent(builder *strings.Builder, element schema.StructureElement) {
 	contentGenerated := false
 
-	for _, rule := range g.structuralRules {
-		if rule.GenerateContent(builder, element) {
+	for _, checker := range g.checkers() {
+		rule, ok := checker.(StructuralRule)
+		if !ok {
+			continue
+		}
+		before := builder.Len()
+		rule.GenerateContent(builder, element)
+		if builder.Len() > before {
+			// A checker only counts as supplying this section when it actually
+			// wrote bytes; a "handled" but empty result still leaves the
+			// default TODO placeholder intact.
 			contentGenerated = true
 		}
 	}
@@ -125,5 +160,10 @@ func (g *Generator) GenerateContent(builder *strings.Builder, element schema.Str
 
 // GenerateFrontmatter generates document frontmatter using the frontmatter generator
 func (g *Generator) GenerateFrontmatter(builder *strings.Builder, s *schema.Schema) {
-	g.frontmatterGenerator.Generate(builder, s)
+	for _, checker := range g.checkers() {
+		if generator, ok := checker.(FrontmatterGenerator); ok {
+			generator.Generate(builder, s)
+			return
+		}
+	}
 }
