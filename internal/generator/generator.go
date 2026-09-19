@@ -20,13 +20,21 @@ func New() *Generator {
 	}
 }
 
+// NewWithRules creates a Generator backed by the given rule generator, so a
+// caller can share one check-piece registry between validation and generation.
+func NewWithRules(ruleGenerator *rules.Generator) *Generator {
+	return &Generator{
+		ruleGenerator: ruleGenerator,
+	}
+}
+
 // Generate creates a markdown template from the schema structure. outputPath (pass "" if
 // unknown) resolves an expr-based heading to its own filename instead of the expression text.
 func (g *Generator) Generate(s *schema.Schema, outputPath string) string {
 	var builder strings.Builder
 
-	// Generate frontmatter if applicable
-	g.ruleGenerator.GenerateFrontmatter(&builder, s)
+	// Generate document-level content (frontmatter) if a piece contributes it
+	g.ruleGenerator.GenerateDocument(&builder, s)
 
 	for _, element := range s.Structure {
 		g.generateElement(&builder, element, 1, outputPath)
